@@ -173,9 +173,20 @@ fn handle_command<'a>(
     Box::pin(async move {
         match cmd {
             Command::RunQuery(raw_query) => {
-                match sqlx::query(&raw_query).fetch_all(&state.pool).await {
+                use sqlx::Row;
+                let wrapped_query = format!(
+                    "SELECT to_jsonb(t)::text FROM ({}) as t;",
+                    raw_query.replace(';', "")
+                );
+                match sqlx::query(&wrapped_query).fetch_all(&state.pool).await {
                     Ok(results) => {
-                        state.result = format!("{:?}", results);
+                        let mut table = Vec::new();
+                        for row in results {
+                            let json_str: String = row.try_get(0).unwrap();
+                            let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+                            table.push(json);
+                        }
+                        state.result = format!("{:#?}", table);
                         state.status = "Query executed successfully".into();
                         state.query.clear();
                     }
