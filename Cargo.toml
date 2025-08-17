@@ -8,4 +8,6 @@ description = "Terminal database viewer for vim users"
 [dependencies]
 crossterm = "0.29.0"
 ratatui = "0.29.0"
-sqlx = "0.8.6"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "uuid"] }
+clap = { version = "4.5.45", features = ["cargo", "derive"] }

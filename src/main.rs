@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use clap::Parser;
 use std::io;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode},
-    event::{DisableMouseCapture, EnableMouseCapture},
+    cursor::Show,
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -29,12 +30,16 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Paragraph},
 };
+use sqlx::PgPool;
 
 #[derive(Debug)]
 pub struct State {
     is_running: bool,
     mode: Mode,
     status: String,
+    query: String,
+    pool: PgPool,
+    result: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,32 +48,83 @@ pub enum Mode {
     Insert,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    RunQuery(String),
+    None,
+    Quit,
+}
+
 impl State {
-    pub fn new() -> Self {
+    pub fn new(pool: PgPool) -> Self {
         Self {
             is_running: true,
             mode: Mode::Normal,
             status: "Welcome to dbvi! Press `q` to quit.".into(),
+            query: String::new(),
+            result: String::new(),
+            pool,
         }
     }
-
-    fn handle_input(&mut self, event: CEvent) {
-        if let CEvent::Key(key) = event {
-            match self.mode {
-                Mode::Normal => match key.code {
-                    KeyCode::Char('q') => self.is_running = false,
-                    KeyCode::Char('i') => self.mode = Mode::Insert,
-                    _ => {}
-                },
-                Mode::Insert => match key.code {
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    _ => {}
-                },
-            }
-        }
-    }
+    //
+    // fn handle_input(&mut self, event: CEvent) -> Command {
+    //     let CEvent::Key(key) = event else {
+    //         return Command::None;
+    //     };
+    //     match self.mode {
+    //         Mode::Normal => match key.code {
+    //             KeyCode::Char('q') => self.is_running = false,
+    //             KeyCode::Char('i') => self.mode = Mode::Insert,
+    //             _ => Command::None,
+    //         },
+    //         Mode::Insert => match key.code {
+    //             KeyCode::Esc => {
+    //                 self.mode = Mode::Normal;
+    //             }
+    //             KeyCode::Char(c) => {
+    //                 self.query.push(c);
+    //             }
+    //             KeyCode::Enter => {
+    //                 self.mode = Mode::Normal;
+    //             }
+    //             _ => {}
+    //         },
+    //     }
+    // }
 }
 
+fn handle_input(state: &mut State, event: CEvent) -> Command {
+    let CEvent::Key(key) = event else {
+        return Command::None;
+    };
+
+    let mode = state.mode;
+    match mode {
+        Mode::Normal => match key.code {
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('i') => {
+                state.mode = Mode::Insert;
+                Command::None
+            }
+            _ => Command::None,
+        },
+        Mode::Insert => match key.code {
+            KeyCode::Esc => {
+                state.mode = Mode::Normal;
+                Command::None
+            }
+            KeyCode::Char(c) => {
+                state.query.push(c);
+                Command::None
+            }
+            KeyCode::Enter => {
+                state.mode = Mode::Normal;
+                Command::RunQuery(state.query.clone())
+            }
+            _ => Command::None,
+        },
+    }
+}
 fn draw_ui(f: &mut ratatui::Frame, state: &State) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -79,7 +135,12 @@ fn draw_ui(f: &mut ratatui::Frame, state: &State) {
         ])
         .split(f.area());
 
-    let body = Paragraph::new("Query results will go here...")
+    let query_result = if state.result.is_empty() {
+        "Query results will go here..."
+    } else {
+        &state.result
+    };
+    let body = Paragraph::new(query_result)
         .block(
             Block::default()
                 .title(Line::from("Results").centered())
@@ -88,21 +149,42 @@ fn draw_ui(f: &mut ratatui::Frame, state: &State) {
         .style(Style::default().fg(Color::White));
     f.render_widget(body, chunks[0]);
 
-    let footer = Paragraph::new(format!("Mode: {:?} | {}", state.mode, state.status))
-        .block(Block::default().borders(Borders::TOP));
+    let footer_text = format!("> {}", state.query);
+    let footer_title = Line::from(format!("Mode: {:?} | {}", state.mode, state.status));
+    let footer = Paragraph::new(footer_text)
+        .block(Block::default().title(footer_title).borders(Borders::TOP));
     f.render_widget(footer, chunks[1]);
 }
 
-fn run_app(
+async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut state: State,
 ) -> io::Result<()> {
     while state.is_running {
         terminal.draw(|f| draw_ui(f, &state))?;
 
-        if event::poll(Duration::from_millis(200))? {
-            let ev = event::read()?;
-            state.handle_input(ev);
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+
+        let ev = event::read()?;
+        let cmd = handle_input(&mut state, ev);
+
+        match cmd {
+            Command::RunQuery(raw_query) => {
+                match sqlx::query(&raw_query).fetch_all(&state.pool).await {
+                    Ok(results) => {
+                        state.result = format!("{:?}", results);
+                        state.status = "Query executed successfully".into();
+                    }
+                    Err(err) => {
+                        state.result = "".into();
+                        state.status = format!("Failed to run query: {}", err);
+                    }
+                }
+            }
+            Command::Quit => state.is_running = false,
+            Command::None => {}
         }
     }
     Ok(())
@@ -110,33 +192,61 @@ fn run_app(
 
 pub struct App {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    pool: PgPool,
 }
 
 impl App {
-    pub fn new() -> io::Result<Self> {
+    pub async fn new(args: &Args) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+
+        let Some(url) = args.url.as_ref() else {
+            // TODO: Maybe have a toast warning the user that the database is not connected
+            restore_terminal_state()?;
+            return Err(io::Error::new(io::ErrorKind::Other, "Missing database URL"));
+        };
+        let pool = PgPool::connect(url)
+            .await
+            .expect("Failed to connect to database");
+
+        Ok(Self { terminal, pool })
     }
 
-    pub fn run(mut self) -> io::Result<()> {
-        let state = State::new();
-        run_app(&mut self.terminal, state)
+    pub async fn run(mut self) -> io::Result<()> {
+        let state = State::new(self.pool.clone());
+        run_app(&mut self.terminal, state).await
     }
+}
+
+#[inline(always)]
+fn restore_terminal_state() -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        Show
+    )?;
+    Ok(())
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        disable_raw_mode().expect("Could not disable raw mode");
-        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
-            .expect("Could not leave alternate screen");
-        self.terminal.show_cursor().expect("Could not show cursor");
+        restore_terminal_state().expect("Failed to restore terminal state");
     }
 }
 
-fn main() -> io::Result<()> {
-    App::new()?.run()
+#[derive(clap::Parser)]
+pub struct Args {
+    #[clap(short, long)]
+    pub url: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let args = Args::parse();
+    App::new(&args).await?.run().await
 }
