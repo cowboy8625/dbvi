@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use std::io;
 use std::time::Duration;
+use std::{io, pin::Pin};
 
 use crossterm::{
     cursor::Show,
@@ -51,6 +51,7 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     RunQuery(String),
+    Chain(Vec<Command>),
     None,
     Quit,
 }
@@ -66,31 +67,6 @@ impl State {
             pool,
         }
     }
-    //
-    // fn handle_input(&mut self, event: CEvent) -> Command {
-    //     let CEvent::Key(key) = event else {
-    //         return Command::None;
-    //     };
-    //     match self.mode {
-    //         Mode::Normal => match key.code {
-    //             KeyCode::Char('q') => self.is_running = false,
-    //             KeyCode::Char('i') => self.mode = Mode::Insert,
-    //             _ => Command::None,
-    //         },
-    //         Mode::Insert => match key.code {
-    //             KeyCode::Esc => {
-    //                 self.mode = Mode::Normal;
-    //             }
-    //             KeyCode::Char(c) => {
-    //                 self.query.push(c);
-    //             }
-    //             KeyCode::Enter => {
-    //                 self.mode = Mode::Normal;
-    //             }
-    //             _ => {}
-    //         },
-    //     }
-    // }
 }
 
 fn handle_input(state: &mut State, event: CEvent) -> Command {
@@ -120,6 +96,14 @@ fn handle_input(state: &mut State, event: CEvent) -> Command {
             KeyCode::Enter => {
                 state.mode = Mode::Normal;
                 Command::RunQuery(state.query.clone())
+            }
+            KeyCode::Backspace => {
+                // TODO: once we make the cursor moveable we will need to account for that here.
+                // So pressing i put you in Insert mode but really that is insert for the
+                // query mode and then if we want app commands :
+                // Probably obviouse.
+                state.query.pop();
+                Command::None
             }
             _ => Command::None,
         },
@@ -153,6 +137,13 @@ fn draw_ui(f: &mut ratatui::Frame, state: &State) {
     let footer_title = Line::from(format!("Mode: {:?} | {}", state.mode, state.status));
     let footer = Paragraph::new(footer_text)
         .block(Block::default().title(footer_title).borders(Borders::TOP));
+    if state.mode == Mode::Insert {
+        // Cursor X: after "> " 2 + 1 so it will be on the right side
+        let cursor_x = 3 + state.query.len() as u16;
+        // Cursor Y: top line of footer chunk
+        let cursor_y = chunks[1].y + 1; // +1 for the border
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
     f.render_widget(footer, chunks[1]);
 }
 
@@ -169,13 +160,24 @@ async fn run_app(
 
         let ev = event::read()?;
         let cmd = handle_input(&mut state, ev);
+        handle_command(cmd, &mut state, terminal).await?;
+    }
+    Ok(())
+}
 
+fn handle_command<'a>(
+    cmd: Command,
+    state: &'a mut State,
+    terminal: &'a mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>> {
+    Box::pin(async move {
         match cmd {
             Command::RunQuery(raw_query) => {
                 match sqlx::query(&raw_query).fetch_all(&state.pool).await {
                     Ok(results) => {
                         state.result = format!("{:?}", results);
                         state.status = "Query executed successfully".into();
+                        state.query.clear();
                     }
                     Err(err) => {
                         state.result = "".into();
@@ -185,9 +187,14 @@ async fn run_app(
             }
             Command::Quit => state.is_running = false,
             Command::None => {}
+            Command::Chain(cmds) => {
+                for cmd in cmds {
+                    handle_command(cmd, state, terminal).await?;
+                }
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub struct App {
